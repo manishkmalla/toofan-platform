@@ -1,0 +1,91 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "041808556268"
+  BACKEND_IMAGE: toofan-backend
+  FRONTEND_IMAGE: toofan-frontend
+
+jobs:
+  # ── Build & Push Docker images to ECR ──────
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for OIDC
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::041808556268:role/GitHubActionsRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push backend image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/$BACKEND_IMAGE:$GITHUB_SHA \
+                       -t $ECR_REGISTRY/$BACKEND_IMAGE:latest \
+                       ./toofan-backend
+          docker push $ECR_REGISTRY/$BACKEND_IMAGE:$GITHUB_SHA
+          docker push $ECR_REGISTRY/$BACKEND_IMAGE:latest
+
+      - name: Build & push frontend image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/$FRONTEND_IMAGE:$GITHUB_SHA \
+                       -t $ECR_REGISTRY/$FRONTEND_IMAGE:latest \
+                       ./toofan-frontend
+          docker push $ECR_REGISTRY/$FRONTEND_IMAGE:$GITHUB_SHA
+          docker push $ECR_REGISTRY/$FRONTEND_IMAGE:latest
+
+  # ── Deploy to EC2 via SSH ───────────────────
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ec2-user/toofan-platform
+
+            # Pull latest images
+            aws ecr get-login-password --region us-east-1 | \
+              docker login --username AWS --password-stdin \
+              041808556268.dkr.ecr.us-east-1.amazonaws.com
+
+            docker compose pull
+
+            # Run DB migrations before restarting backend
+            docker compose run --rm toofan-backend \
+              npx prisma migrate deploy
+
+            # Rolling restart (zero-downtime for frontend/backend)
+            docker compose up -d --no-deps toofan-backend toofan-frontend
+
+            # Cleanup old images
+            docker image prune -f
